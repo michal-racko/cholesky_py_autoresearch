@@ -29,7 +29,7 @@ command -v claude-third-party-opus-4.8 >/dev/null || { echo "claude CLI not foun
 # denominator. Only runs when no best-known snapshot exists yet.
 if [ ! -f "$AR/best/best.json" ]; then
     echo "=== no baseline yet: measuring current submission.py ==="
-    python3 "$AR/run_experiment.py" --baseline 2>&1 | tee "$AR/logs/baseline.log"
+    /home/ubuntu/.venvs/cholesky/bin/python "$AR/run_experiment.py" --baseline 2>&1 | tee "$AR/logs/baseline.log"
     [ -f "$AR/best/best.json" ] || { echo "baseline failed; see $AR/logs/baseline.log" >&2; exit 1; }
 fi
 
@@ -47,7 +47,7 @@ for i in $(seq 1 "$ITERATIONS"); do
     # CANDIDATE.json. It has no Modal access; only file edits are auto-allowed.
     claude-third-party-opus-4.8 -p "$(cat "$AR/RESEARCH.md")" \
         --permission-mode acceptEdits \
-        --allowed-tools "Read,Glob,Grep,Edit,Write,Bash(python -m py_compile:*),Bash(python3 -m py_compile:*),WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com)" \
+        --allowed-tools "Read,Glob,Grep,Edit,Write,Bash(/home/ubuntu/.venvs/cholesky/bin/python -m py_compile:*),Bash(/home/ubuntu/.venvs/cholesky/bin/python -m py_compile:*),WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com)" \
         --max-turns 50 \
         ${CLAUDE_ARGS:-} \
         2>&1 | tee -a "$log"
@@ -64,17 +64,17 @@ for i in $(seq 1 "$ITERATIONS"); do
     fi
     consecutive_agent_failures=0
 
-    if python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('stop') else 1)" "$AR/CANDIDATE.json"; then
+    if /home/ubuntu/.venvs/cholesky/bin/python -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('stop') else 1)" "$AR/CANDIDATE.json"; then
         echo "agent requested stop:" | tee -a "$log"
-        python3 -m json.tool "$AR/CANDIDATE.json" | tee -a "$log"
+        /home/ubuntu/.venvs/cholesky/bin/python -m json.tool "$AR/CANDIDATE.json" | tee -a "$log"
         break
     fi
 
     # Deterministic half: compile gate, Modal correctness tests, Modal
     # benchmarks, keep-or-revert, ledger append.
-    python3 "$AR/run_experiment.py" --candidate "$AR/CANDIDATE.json" 2>&1 | tee -a "$log"
+    /home/ubuntu/.venvs/cholesky/bin/python "$AR/run_experiment.py" --candidate "$AR/CANDIDATE.json" 2>&1 | tee -a "$log"
 done
 
 echo ""
 echo "=== ledger summary ==="
-python3 "$AR/run_experiment.py" --summary
+/home/ubuntu/.venvs/cholesky/bin/python "$AR/run_experiment.py" --summary
