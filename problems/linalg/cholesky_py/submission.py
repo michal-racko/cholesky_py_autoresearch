@@ -60,20 +60,90 @@ def _cholesky_left_kernel(
 # so everything else falls back to torch.linalg.cholesky_ex.
 _NUM_WARPS = {32: 1}
 
+# Block-column width for the tensor-core path. The trailing rank-b update is a
+# TF32 GEMM (the bulk of the O(n^3/3) work); the diagonal factorization and
+# panel solve of each b-wide column stay in FP32.
+_TF32_BLOCK = 1024
+
+# Smallest n for which the blocked TF32 factorization is used. Below this,
+# cuSOLVER's single-matrix potrf wins and TF32 rounding is too large for the
+# residual gate (allowed reconstruction residual scales with n). Measured on a
+# B200: n=8192 breaks even, n=16384 ~2x, n=32768 ~4x.
+_TF32_MIN_N = 8192
+
+# At n>=4096 with batch>=2, cuSOLVER's *batched* potrf is pathological (~4x
+# worse per matrix than a single-matrix call on a B200). Below this n the
+# batched path is fine, so only loop per matrix at or above it.
+_LOOP_BATCH_MIN_N = 4096
+
+
+def _blocked_cholesky_tf32(data: torch.Tensor, block: int) -> torch.Tensor:
+    """Left-looking blocked Cholesky with the trailing update in TF32.
+
+    For each block column ``[j, je)`` we form the accumulated left-panel product
+    ``S = L[j:, :j] @ L[j:je, :j].T`` (a single TF32 GEMM, >90% of the FLOPs),
+    subtract it from the corresponding block of A, factor the ``b x b`` diagonal
+    block in FP32, and solve the panel below it with an FP32 triangular solve.
+
+    Runs batched: ``data`` is ``(batch, n, n)`` and every op broadcasts over the
+    batch dim, so no matrix is ever handed to a batched potrf whole.
+    """
+    n = data.shape[-1]
+    out = torch.zeros_like(data)
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        for j in range(0, n, block):
+            je = min(j + block, n)
+            if j > 0:
+                left_top = out[..., j:je, :j]
+                s_top = left_top @ left_top.mT
+                a_top = data[..., j:je, j:je] - s_top
+            else:
+                a_top = data[..., j:je, j:je]
+
+            l_top = torch.linalg.cholesky_ex(a_top, check_errors=False).L
+            out[..., j:je, j:je] = l_top
+
+            if je < n:
+                below = data[..., je:, j:je]
+                if j > 0:
+                    below = below - out[..., je:, :j] @ left_top.mT
+                out[..., je:, j:je] = torch.linalg.solve_triangular(
+                    l_top.mT, below, upper=True, left=False
+                )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    return out
+
 
 def custom_kernel(data: input_t) -> output_t:
-    batch, n, _ = data.shape
-    num_warps = _NUM_WARPS.get(n)
-    if num_warps is None or not data.is_cuda or data.dtype != torch.float32:
+    if not data.is_cuda or data.dtype != torch.float32:
         return torch.linalg.cholesky_ex(data, check_errors=False).L
 
-    data = data.contiguous()
-    output = torch.empty_like(data)
-    _cholesky_left_kernel[(batch,)](
-        data,
-        output,
-        n * n,
-        BLOCK_N=n,
-        num_warps=num_warps,
-    )
-    return output
+    n = data.shape[-1]
+
+    num_warps = _NUM_WARPS.get(n)
+    if num_warps is not None:
+        data = data.contiguous()
+        output = torch.empty_like(data)
+        _cholesky_left_kernel[(data.shape[0],)](
+            data,
+            output,
+            n * n,
+            BLOCK_N=n,
+            num_warps=num_warps,
+        )
+        return output
+
+    if n >= _TF32_MIN_N:
+        return _blocked_cholesky_tf32(data.contiguous(), _TF32_BLOCK)
+
+    # Work around cuSOLVER's slow batched potrf for large matrices by factoring
+    # each matrix on its own well-tuned single-matrix path.
+    if n >= _LOOP_BATCH_MIN_N and data.shape[0] > 1:
+        return torch.stack(
+            [torch.linalg.cholesky_ex(m, check_errors=False).L for m in data]
+        )
+
+    return torch.linalg.cholesky_ex(data, check_errors=False).L
