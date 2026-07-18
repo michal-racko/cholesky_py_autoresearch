@@ -71,10 +71,14 @@ _TF32_BLOCK = 1024
 # B200: n=8192 breaks even, n=16384 ~2x, n=32768 ~4x.
 _TF32_MIN_N = 8192
 
-# At n>=4096 with batch>=2, cuSOLVER's *batched* potrf is pathological (~4x
-# worse per matrix than a single-matrix call on a B200). Below this n the
-# batched path is fine, so only loop per matrix at or above it.
-_LOOP_BATCH_MIN_N = 4096
+# cuSOLVER's *batched* potrf is pathological for large matrices at small batch
+# (measured on a B200: ~4x worse per matrix than a single-matrix call at
+# n=4096/batch=2, and ~2.8x at n=2048/batch=2). Factoring each matrix on the
+# well-tuned single-matrix path wins there. But the batched path amortizes fine
+# once the batch is large (n=2048/batch=8 is efficient), so only loop when the
+# matrix is big AND the batch is small.
+_LOOP_MIN_N = 2048
+_LOOP_MAX_BATCH = 4
 
 
 def _blocked_cholesky_tf32(data: torch.Tensor, block: int) -> torch.Tensor:
@@ -139,9 +143,10 @@ def custom_kernel(data: input_t) -> output_t:
     if n >= _TF32_MIN_N:
         return _blocked_cholesky_tf32(data.contiguous(), _TF32_BLOCK)
 
-    # Work around cuSOLVER's slow batched potrf for large matrices by factoring
-    # each matrix on its own well-tuned single-matrix path.
-    if n >= _LOOP_BATCH_MIN_N and data.shape[0] > 1:
+    # Work around cuSOLVER's slow batched potrf for large matrices at small
+    # batch by factoring each matrix on its own well-tuned single-matrix path.
+    batch = data.shape[0]
+    if n >= _LOOP_MIN_N and 1 < batch <= _LOOP_MAX_BATCH:
         return torch.stack(
             [torch.linalg.cholesky_ex(m, check_errors=False).L for m in data]
         )
